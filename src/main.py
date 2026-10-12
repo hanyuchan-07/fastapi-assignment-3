@@ -31,7 +31,7 @@ def handle_custom_exception(request: Request, exc: CustomException):
 
 @app.get("/")
 def get_root():
-    return {"message": "Hello, World!"}
+    return {"message": "Hello, hanyuchan! Auto deployment works!"}
 
 
 @app.get("/health")
