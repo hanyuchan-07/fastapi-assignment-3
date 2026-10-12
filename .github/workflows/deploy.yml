@@ -1,0 +1,228 @@
+name: Deploy assignment 3
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: assignment3-ec2-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-2
+  AWS_PAGER: ""
+  AWS_RETRY_MODE: standard
+  AWS_MAX_ATTEMPTS: "3"
+  SECURITY_GROUP_ID: sg-0bf1f672e6241ea99
+  IMAGE_REPOSITORY: hanyuchan/fastapi-assignment-3
+  RULE_DESCRIPTION: assignment3-${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Check settings and calculate source hash
+        id: source
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_HOST_FINGERPRINT: ${{ secrets.EC2_HOST_FINGERPRINT }}
+        run: |
+          python3 - <<'PY'
+          import ipaddress
+          import os
+          import re
+          import runpy
+
+          assert os.environ["EC2_USER"] == "ubuntu", "EC2_USER must be ubuntu"
+          host = os.environ["EC2_HOST"]
+          assert ipaddress.ip_address(host).version == 4, "EC2_HOST must be an IPv4 address"
+          assert re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", os.environ["EC2_HOST_FINGERPRINT"]), "Check EC2_HOST_FINGERPRINT"
+          info = runpy.run_path("deployment_info.py")
+          assert info["server_ip"] == host, "server_ip and EC2_HOST must match"
+          assert info["image_repository"] == os.environ["IMAGE_REPOSITORY"], "Check image_repository"
+          source = runpy.run_path("src/common/source_hash.py")
+          digest = source["get_all_src_py_files_hash"]()
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"hash={digest}\n")
+          print("Settings and source hash checked.")
+          PY
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Build and push SHA image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE_REPOSITORY }}:${{ github.sha }}
+
+      - name: Authenticate to AWS
+        id: aws
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: "074765589341"
+          role-duration-seconds: 3600
+          action-timeout-s: 120
+
+      - name: Allow temporary SSH access
+        id: open_ssh
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          runner_ip="$(curl -4fsS --retry 2 --connect-timeout 5 --max-time 15 https://checkip.amazonaws.com)"
+          python3 -c 'import ipaddress,sys; ip=ipaddress.ip_address(sys.argv[1]); assert ip.version == 4 and ip.is_global' "$runner_ip"
+          permissions="$(jq -nc \
+            --arg cidr "$runner_ip/32" \
+            --arg description "$RULE_DESCRIPTION" \
+            '[{IpProtocol:"tcp",FromPort:22,ToPort:22,IpRanges:[{CidrIp:$cidr,Description:$description}]}]')"
+          rule_id="$(aws ec2 authorize-security-group-ingress \
+            --group-id "$SECURITY_GROUP_ID" \
+            --ip-permissions "$permissions" \
+            --query 'SecurityGroupRules[0].SecurityGroupRuleId' --output text)"
+          [[ "$rule_id" =~ ^sgr-[0-9a-f]+$ ]]
+          printf 'rule_id=%s\n' "$rule_id" >> "$GITHUB_OUTPUT"
+
+      - name: Verify SSH host and deploy
+        timeout-minutes: 12
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EXPECTED_FINGERPRINT: ${{ secrets.EC2_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/assignment3-key"
+          hosts_file="$RUNNER_TEMP/assignment3-known-hosts"
+          umask 077
+          trap 'rm -f "$key_file" "$hosts_file"' EXIT
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$key_file"
+          ssh-keygen -y -P "" -f "$key_file" > /dev/null
+
+          for attempt in {1..6}; do
+            if ssh-keyscan -4 -T 10 -t ed25519 "$EC2_HOST" > "$hosts_file" 2>/dev/null && test -s "$hosts_file"; then
+              break
+            fi
+            sleep 3
+          done
+          test -s "$hosts_file"
+          actual_fingerprint="$(ssh-keygen -lf "$hosts_file" -E sha256 | awk '{print $2}')"
+          if [[ "$actual_fingerprint" != "$EXPECTED_FINGERPRINT" ]]; then
+            echo "::error::SSH host fingerprint mismatch. Deployment stopped."
+            exit 1
+          fi
+
+          timeout 600 ssh -4 -i "$key_file" \
+            -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519 \
+            -o "UserKnownHostsFile=$hosts_file" -o GlobalKnownHostsFile=/dev/null \
+            "$EC2_USER@$EC2_HOST" bash -s -- "$IMAGE_REPOSITORY:$GITHUB_SHA" <<'REMOTE'
+          set -euo pipefail
+          image="$1"
+          container="fastapi-assignment-3"
+          owner="hanyuchan-07/fastapi-assignment-3"
+
+          sudo -n docker pull "$image"
+          if sudo -n docker container inspect "$container" > /dev/null 2>&1; then
+            existing_owner="$(sudo -n docker inspect --format '{{ index .Config.Labels "assignment.repository" }}' "$container")"
+            if [ "$existing_owner" != "$owner" ]; then
+              echo "Existing container is not managed by this workflow. Stopping deployment."
+              exit 1
+            fi
+            sudo -n docker stop "$container"
+            sudo -n docker rm "$container"
+          fi
+          sudo -n docker run -d \
+            --name "$container" \
+            --label "assignment.repository=$owner" \
+            --restart unless-stopped \
+            -p 80:8000 \
+            "$image"
+          REMOTE
+
+      - name: Check public health and source hash
+        timeout-minutes: 5
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EXPECTED_HASH: ${{ steps.source.outputs.hash }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+
+          url = "http://" + os.environ["EC2_HOST"] + "/health"
+          for attempt in range(30):
+              try:
+                  with urllib.request.urlopen(url, timeout=5) as response:
+                      assert response.status == 200
+                      data = json.load(response)
+                  assert data.get("status") == "ok"
+                  assert data.get("hash") == os.environ["EXPECTED_HASH"]
+                  print("Public /health returned 200 and the source hash matches.")
+                  break
+              except Exception:
+                  print(f"Waiting for the correct deployment: {attempt + 1}/30")
+                  time.sleep(3)
+          else:
+              raise SystemExit("Health check failed or deployed source hash does not match.")
+          PY
+
+      - name: Remove temporary SSH access
+        if: ${{ always() && steps.aws.outcome == 'success' }}
+        timeout-minutes: 3
+        env:
+          CREATED_RULE_ID: ${{ steps.open_ssh.outputs.rule_id }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$CREATED_RULE_ID" ]]; then
+            if ! aws ec2 revoke-security-group-ingress \
+              --group-id "$SECURITY_GROUP_ID" \
+              --security-group-rule-ids "$CREATED_RULE_ID" > /dev/null; then
+              echo "::warning::Initial rule removal failed; checking and retrying."
+            fi
+          fi
+
+          for attempt in {1..6}; do
+            rules="$(aws ec2 describe-security-group-rules \
+              --filters "Name=group-id,Values=$SECURITY_GROUP_ID" --output json)"
+            ids="$(jq -r --arg description "$RULE_DESCRIPTION" \
+              '.SecurityGroupRules[] | select(.Description == $description and .IsEgress == false and .IpProtocol == "tcp" and .FromPort == 22 and .ToPort == 22) | .SecurityGroupRuleId' <<< "$rules")"
+            if [[ -z "$ids" ]]; then
+              echo "Temporary SSH access removed."
+              exit 0
+            fi
+            for rule_id in $ids; do
+              if ! aws ec2 revoke-security-group-ingress \
+                --group-id "$SECURITY_GROUP_ID" \
+                --security-group-rule-ids "$rule_id" > /dev/null; then
+                echo "::warning::Retrying removal of this run's temporary rule."
+              fi
+            done
+            sleep 3
+          done
+          echo "::error::Temporary SSH rule cleanup could not be verified. Check the security group."
+          exit 1
